@@ -1,0 +1,678 @@
+#!/usr/bin/env python3
+"""
+VehicleNet Monitor — Node 2 (Raspberry Pi Edge Server)
+=======================================================
+Role : Receive encrypted LoRa from Node 1, decrypt, classify faults,
+       store in SQLite, serve Flask dashboard, send email alerts,
+       and forward status to Node 3 via LoRa (V2V relay).
+
+Requirements (install with pip):
+    pip install flask pyserial RPi.GPIO scikit-learn openpyxl
+
+LoRa library:
+    Clone pySX127x: https://github.com/mayeranalytics/pySX127x
+    sudo python3 setup.py install
+
+GPIO Wiring (SX1278 → Raspberry Pi 5):
+    VCC  → 3.3V
+    GND  → GND
+    MOSI → GPIO10 (SPI0 MOSI)
+    MISO → GPIO9  (SPI0 MISO)
+    SCK  → GPIO11 (SPI0 SCLK)
+    NSS  → GPIO8  (SPI0 CE0)
+    RST  → GPIO22
+    DIO0 → GPIO4  (interrupt)
+
+Usage:
+    python3 edge_server.py
+Dashboard:
+    http://0.0.0.0:5000   (local LAN)
+    http://<zerotier_ip>:5000  (remote via ZeroTier)
+"""
+
+import os, sys, time, zlib, threading, logging, smtplib, json
+from datetime import datetime
+from collections import deque
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+
+# ─── Third-party ──────────────────────────────────────────────────────────────
+from flask import Flask, jsonify, request, render_template_string
+import sqlite3
+
+# ─── LoRa (pySX127x) ─────────────────────────────────────────────────────────
+try:
+    from SX127x.LoRa import *
+    from SX127x.board_config import BOARD
+    LORA_AVAILABLE = True
+except ImportError:
+    LORA_AVAILABLE = False
+    print("WARNING: pySX127x not installed. Running in SIMULATION mode.")
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  CONFIGURATION  — edit these values before deployment
+# ══════════════════════════════════════════════════════════════════════════════
+NETWORK_KEY   = 0x5A
+NODE1_ADDR    = 0x01
+NODE2_ADDR    = 0x02
+NODE3_ADDR    = 0x03
+
+LORA_FREQ     = 433.0          # MHz
+LORA_SF       = 9
+LORA_BW       = BW.BW125 if LORA_AVAILABLE else None
+LORA_CR       = CODING_RATE.CR4_5 if LORA_AVAILABLE else None
+LORA_SYNC     = 0x12
+
+DB_PATH       = "vehicle_data.db"
+FLASK_PORT    = 5000
+FLASK_HOST    = "0.0.0.0"
+
+# Email (Gmail SMTP) — fill in or leave blank to disable
+EMAIL_SENDER   = ""            # e.g. "yourmail@gmail.com"
+EMAIL_PASSWORD = ""            # App password (not account password)
+EMAIL_RECIPIENT = ""           # Fleet manager email
+EMAIL_COOLDOWN = 60            # seconds per event type
+
+# Detection thresholds (tunable via /api/thresholds)
+THRESHOLDS = {
+    "crash_g":   25.0,   # m/s²  total acceleration > this → CRASH
+    "fall_g":     1.5,   # m/s²  total acceleration < this → FALL
+    "gas_ppm":  2000.0,  # ppm   gas concentration > this → GAS_ALERT
+    "mpu_zero":   0.3,   # m/s²  < this → MPU_ERROR (sensor dead)
+    "mpu_max":   80.0,   # m/s²  > this → MPU_ERROR (sensor noise)
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  LOGGING
+# ══════════════════════════════════════════════════════════════════════════════
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s  %(levelname)-8s  %(message)s",
+    datefmt="%H:%M:%S.%f"[:-3]
+)
+log = logging.getLogger("VehicleNet")
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SHARED STATE
+# ══════════════════════════════════════════════════════════════════════════════
+state_lock    = threading.Lock()
+thresh_lock   = threading.Lock()
+tx_queue      = deque()           # packets to forward to Node 3
+last_counter  = -1                # replay protection
+email_cooldown = {}               # event_type → last_sent timestamp
+latest_data   = {}                # cached for live dashboard
+node2_tx_counter = 0              # counter for Node2→Node3 transmissions
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  DATABASE
+# ══════════════════════════════════════════════════════════════════════════════
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS sensor_data (
+            id        INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts        TEXT,
+            event     TEXT,
+            ax REAL, ay REAL, az REAL,
+            gx REAL, gy REAL, gz REAL,
+            lat REAL, lon REAL,
+            tmp REAL, hum REAL, prs REAL,
+            gas REAL, spd REAL,
+            a_total REAL,
+            rssi INTEGER
+        )
+    """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS alerts (
+            id        INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts        TEXT,
+            event     TEXT,
+            a_total REAL,
+            gas  REAL,
+            lat  REAL,
+            lon  REAL
+        )
+    """)
+    conn.commit()
+    conn.close()
+    log.info("Database ready: %s", DB_PATH)
+
+def insert_record(fields: dict, rssi: int):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    ts = datetime.utcnow().isoformat(timespec="seconds")
+    c.execute("""
+        INSERT INTO sensor_data
+        (ts,event,ax,ay,az,gx,gy,gz,lat,lon,tmp,hum,prs,gas,spd,a_total,rssi)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+    """, (ts, fields["event"],
+          fields["ax"], fields["ay"], fields["az"],
+          fields["gx"], fields["gy"], fields["gz"],
+          fields["lat"], fields["lon"],
+          fields["tmp"], fields["hum"], fields["prs"],
+          fields["gas"], fields["spd"],
+          fields["a_total"], rssi))
+    if fields["event"] != "NORMAL":
+        c.execute("""
+            INSERT INTO alerts (ts,event,a_total,gas,lat,lon)
+            VALUES (?,?,?,?,?,?)
+        """, (ts, fields["event"], fields["a_total"],
+              fields["gas"], fields["lat"], fields["lon"]))
+    conn.commit()
+    conn.close()
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SECURITY — XOR decrypt + CRC32 verify
+# ══════════════════════════════════════════════════════════════════════════════
+def xor_decrypt(hex_data: str, counter: int) -> str:
+    raw = bytes.fromhex(hex_data)
+    plain = bytearray(len(raw))
+    for i, byte in enumerate(raw):
+        key_byte = ((NETWORK_KEY ^ (counter & 0xFF)) + (i & 0x1F)) & 0xFF
+        plain[i] = byte ^ key_byte
+    return plain.decode("ascii", errors="replace")
+
+def verify_crc(payload: str) -> tuple:
+    """Return (body, valid) after stripping & checking CRC32."""
+    if "|" not in payload:
+        return payload, False
+    parts = payload.rsplit("|", 1)
+    if len(parts) != 2 or len(parts[1]) != 8:
+        return payload, False
+    body, received_crc = parts[0], parts[1]
+    calc = zlib.crc32(body.encode()) & 0xFFFFFFFF
+    expected = int(received_crc, 16)
+    return body, calc == expected
+
+def parse_packet(raw_message: str) -> tuple:
+    """
+    Parse 'ENC:<counter>::<hex>'
+    Returns (fields_dict, counter_int) or (None, None) on failure.
+    """
+    global last_counter
+    if not raw_message.startswith("ENC:"):
+        return None, None
+    try:
+        prefix, hex_data = raw_message.split("::", 1)
+        counter_str = prefix[4:]  # strip "ENC:"
+        counter = int(counter_str, 16)
+    except (ValueError, IndexError):
+        log.warning("Bad packet format")
+        return None, None
+
+    # Replay protection
+    with state_lock:
+        if counter <= last_counter and last_counter != -1:
+            log.warning("REPLAY ATTACK detected! counter=%d last=%d",
+                        counter, last_counter)
+            return None, None
+        last_counter = counter
+
+    # Decrypt
+    plaintext = xor_decrypt(hex_data, counter)
+
+    # CRC verify
+    body, valid = verify_crc(plaintext)
+    if not valid:
+        log.warning("CRC MISMATCH — packet dropped")
+        return None, None
+
+    # Parse fields: N1|01|02|EVENT|ax|ay|az|gx|gy|gz|lat|lon|tmp|hum|prs|gas|spd
+    parts = body.split("|")
+    if len(parts) < 17:
+        log.warning("Insufficient fields: %d", len(parts))
+        return None, None
+
+    try:
+        fields = {
+            "node":  parts[0],
+            "src":   parts[1],
+            "dst":   parts[2],
+            "event": parts[3],
+            "ax":    float(parts[4]),
+            "ay":    float(parts[5]),
+            "az":    float(parts[6]),
+            "gx":    float(parts[7]),
+            "gy":    float(parts[8]),
+            "gz":    float(parts[9]),
+            "lat":   float(parts[10]),
+            "lon":   float(parts[11]),
+            "tmp":   float(parts[12]),
+            "hum":   float(parts[13]),
+            "prs":   float(parts[14]),
+            "gas":   float(parts[15]),
+            "spd":   float(parts[16]),
+        }
+    except (ValueError, IndexError) as e:
+        log.warning("Parse error: %s", e)
+        return None, None
+
+    return fields, counter
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  FAULT DETECTION
+# ══════════════════════════════════════════════════════════════════════════════
+def classify_event(fields: dict) -> str:
+    import math
+    with thresh_lock:
+        t = dict(THRESHOLDS)
+
+    ax, ay, az = fields["ax"], fields["ay"], fields["az"]
+    a_total = math.sqrt(ax**2 + ay**2 + az**2)
+    fields["a_total"] = a_total
+    gas = fields["gas"]
+
+    # Priority order
+    if a_total < t["mpu_zero"] or a_total > t["mpu_max"]:
+        return "MPU_ERROR"
+    if a_total > t["crash_g"]:
+        return "CRASH"
+    if a_total < t["fall_g"]:
+        return "FALL"
+    if gas > t["gas_ppm"]:
+        return "GAS_ALERT"
+    return "NORMAL"
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  EMAIL ALERTS
+# ══════════════════════════════════════════════════════════════════════════════
+def send_email_alert(fields: dict):
+    if not EMAIL_SENDER or not EMAIL_RECIPIENT:
+        return
+    event = fields["event"]
+    now = time.time()
+    global email_cooldown
+    if now - email_cooldown.get(event, 0) < EMAIL_COOLDOWN:
+        return
+    email_cooldown[event] = now
+
+    def _send():
+        try:
+            ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+            maps_url = (f"https://maps.google.com/?q="
+                        f"{fields['lat']},{fields['lon']}")
+            body_html = f"""
+            <html><body>
+            <h2 style="color:red;">🚨 {event} DETECTED</h2>
+            <p><strong>Time:</strong> {ts}</p>
+            <table border="1" cellpadding="6" style="border-collapse:collapse">
+              <tr><td>Event</td><td><b>{event}</b></td></tr>
+              <tr><td>Total Acceleration</td><td>{fields['a_total']:.3f} m/s²</td></tr>
+              <tr><td>Gas Level</td><td>{fields['gas']:.1f} ppm</td></tr>
+              <tr><td>Temperature</td><td>{fields['tmp']:.1f} °C</td></tr>
+              <tr><td>GPS Coordinates</td>
+                  <td>{fields['lat']:.6f}, {fields['lon']:.6f}</td></tr>
+              <tr><td>Google Maps</td>
+                  <td><a href="{maps_url}">Open Location</a></td></tr>
+            </table>
+            </body></html>"""
+            msg = MIMEMultipart("alternative")
+            msg["Subject"] = f"Vehicle Alert: {event} at {ts}"
+            msg["From"]    = EMAIL_SENDER
+            msg["To"]      = EMAIL_RECIPIENT
+            msg.attach(MIMEText(body_html, "html"))
+            with smtplib.SMTP_SSL("smtp.gmail.com", 465) as s:
+                s.login(EMAIL_SENDER, EMAIL_PASSWORD)
+                s.sendmail(EMAIL_SENDER, EMAIL_RECIPIENT, msg.as_string())
+            log.info("Email sent for %s", event)
+        except Exception as e:
+            log.error("Email error: %s", e)
+
+    threading.Thread(target=_send, daemon=True).start()
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  V2V PACKET BUILDER  (Node2 → Node3)
+# ══════════════════════════════════════════════════════════════════════════════
+def build_v2v_packet(fields: dict) -> str:
+    global node2_tx_counter
+    node2_tx_counter += 1
+    body = (f"N2|{NODE2_ADDR:02X}|{NODE3_ADDR:02X}"
+            f"|{fields['event']}"
+            f"|{fields['lat']:.6f}"
+            f"|{fields['lon']:.6f}")
+    crc  = zlib.crc32(body.encode()) & 0xFFFFFFFF
+    full = f"{body}|{crc:08X}"
+    # Encrypt
+    raw = full.encode()
+    enc = bytearray(len(raw))
+    ctr = node2_tx_counter
+    for i, b in enumerate(raw):
+        key_byte = ((NETWORK_KEY ^ (ctr & 0xFF)) + (i & 0x1F)) & 0xFF
+        enc[i] = b ^ key_byte
+    hex_enc = enc.hex().upper()
+    return f"ENC:{ctr:04X}::{hex_enc}"
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  PACKET PROCESSOR  (called from LoRa RX callback)
+# ══════════════════════════════════════════════════════════════════════════════
+def process_packet(raw_msg: str, rssi: int):
+    global latest_data
+    fields, counter = parse_packet(raw_msg)
+    if fields is None:
+        return
+
+    # Classify
+    event = classify_event(fields)
+    fields["event"] = event
+
+    # Log
+    log.info("VALID [#%d] | RSSI:%d dBm | Event:%s | "
+             "Accel:%.3f m/s² | Gas:%.1fppm | T:%.1f°C | GPS:%.4f,%.4f",
+             counter, rssi, event, fields["a_total"],
+             fields["gas"], fields["tmp"], fields["lat"], fields["lon"])
+
+    # Async DB insert
+    threading.Thread(
+        target=insert_record, args=(fields, rssi), daemon=True
+    ).start()
+
+    # Update live cache
+    with state_lock:
+        latest_data = {**fields, "rssi": rssi,
+                       "ts": datetime.utcnow().isoformat(timespec="seconds")}
+
+    # Email alert
+    if event != "NORMAL":
+        send_email_alert(fields)
+
+    # Queue V2V packet for Node 3
+    v2v = build_v2v_packet(fields)
+    tx_queue.append(v2v)
+    log.info("V2V queued → Node 3 | %s", v2v[:40] + "...")
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  LoRa RADIO (pySX127x)
+# ══════════════════════════════════════════════════════════════════════════════
+if LORA_AVAILABLE:
+    class VehicleLoRa(LoRa):
+        def __init__(self, verbose=False):
+            super().__init__(verbose)
+
+        def on_rx_done(self):
+            try:
+                payload = self.read_payload(nocheck=True)
+                raw_msg = bytes(payload).decode("ascii", errors="ignore").strip()
+                rssi    = self.get_pkt_rssi_value()
+                log.info("RX raw: %s... RSSI:%d", raw_msg[:50], rssi)
+                process_packet(raw_msg, rssi)
+                self.clear_irq_flags(RxDone=1)
+                self.reset_ptr_rx()
+                self.set_mode(MODE.RXCONT)
+            except Exception as e:
+                log.error("RX error: %s", e)
+
+        def on_tx_done(self):
+            log.info("TX DONE — returning to RX")
+            self.set_dio_mapping([0, 0, 0, 0, 0, 0])
+            self.set_mode(MODE.RXCONT)
+            self.clear_irq_flags(TxDone=1)
+
+    _lora = None
+
+    def init_lora():
+        global _lora
+        BOARD.setup()
+        _lora = VehicleLoRa(verbose=False)
+        _lora.set_mode(MODE.SLEEP)
+        _lora.set_freq(LORA_FREQ)
+        _lora.set_pa_config(pa_select=1, max_power=0x0F, output_power=0x0F)
+        _lora.set_spreading_factor(LORA_SF)
+        _lora.set_bw(LORA_BW)
+        _lora.set_coding_rate(LORA_CR)
+        _lora.set_sync_word(LORA_SYNC)
+        _lora.set_rx_crc(True)
+        _lora.set_preamble(12)
+        _lora.set_dio_mapping([0, 0, 0, 0, 0, 0])
+        _lora.set_mode(MODE.RXCONT)
+        log.info("LoRa radio initialised — %s MHz SF%d", LORA_FREQ, LORA_SF)
+
+    def transmit_v2v(packet_str: str):
+        """Switch to TX, send, return to RX."""
+        global _lora
+        if _lora is None:
+            return
+        try:
+            _lora.set_mode(MODE.STDBY)
+            _lora.set_dio_mapping([1, 0, 0, 0, 0, 0])  # DIO0 = TxDone
+            payload = [b for b in packet_str.encode()]
+            _lora.write_payload(payload)
+            _lora.set_mode(MODE.TX)
+            # Wait for TxDone (up to 2 s)
+            for _ in range(200):
+                flags = _lora.get_irq_flags()
+                if flags.get("tx_done"):
+                    break
+                time.sleep(0.01)
+            _lora.clear_irq_flags(TxDone=1)
+            _lora.set_dio_mapping([0, 0, 0, 0, 0, 0])
+            _lora.set_mode(MODE.RXCONT)
+            log.info("V2V transmitted successfully")
+        except Exception as e:
+            log.error("TX error: %s", e)
+            try:
+                _lora.set_mode(MODE.RXCONT)
+            except:
+                pass
+
+    def lora_worker():
+        """LoRa interrupt loop — runs in its own thread."""
+        init_lora()
+        while True:
+            if tx_queue:
+                pkt = tx_queue.popleft()
+                log.info(">> [TX OUT] Forwarding status to Node 3...")
+                transmit_v2v(pkt)
+            time.sleep(0.05)
+
+else:
+    # Simulation mode — print dummy data every 5 s
+    def lora_worker():
+        import math
+        ctr = 0
+        while True:
+            time.sleep(5)
+            dummy = {
+                "ax": 0.12, "ay": -0.05, "az": 9.79,
+                "gx": 0.001,"gy": 0.002, "gz": -0.001,
+                "lat": 11.0045, "lon": 76.9616,
+                "tmp": 28.5, "hum": 65.0, "prs": 975.0,
+                "gas": 150.0, "spd": 0.0,
+                "a_total": math.sqrt(0.12**2 + 0.05**2 + 9.79**2),
+                "event": "NORMAL"
+            }
+            ctr += 1
+            dummy["a_total"] = math.sqrt(
+                dummy["ax"]**2 + dummy["ay"]**2 + dummy["az"]**2)
+            dummy["event"] = classify_event(dummy)
+            with state_lock:
+                global latest_data
+                latest_data = {**dummy, "rssi": -85,
+                               "ts": datetime.utcnow().isoformat(timespec="seconds")}
+            log.info("SIM [#%d] Event:%s | Accel:%.3f", ctr,
+                     dummy["event"], dummy["a_total"])
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  FLASK DASHBOARD
+# ══════════════════════════════════════════════════════════════════════════════
+DASHBOARD_HTML = """
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>VehicleNet Monitor</title>
+  <meta http-equiv="refresh" content="3">
+  <link rel="stylesheet"
+    href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: 'Segoe UI', sans-serif;
+           background: #0d1117; color: #c9d1d9; }
+    header { background: #161b22; padding: 12px 24px;
+             display: flex; align-items: center; gap: 16px;
+             border-bottom: 1px solid #30363d; }
+    header h1 { font-size: 1.2rem; color: #58a6ff; }
+    .badge { padding: 3px 10px; border-radius: 12px;
+             font-size: .75rem; font-weight: 700; }
+    .badge.normal { background: #238636; color: #fff; }
+    .badge.alert  { background: #da3633; color: #fff; }
+    .grid { display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(160px,1fr));
+            gap: 12px; padding: 20px 24px; }
+    .card { background: #161b22; border: 1px solid #30363d;
+            border-radius: 8px; padding: 14px; }
+    .card label { font-size: .7rem; color: #8b949e; text-transform: uppercase; }
+    .card .val { font-size: 1.5rem; font-weight: 700; color: #58a6ff; }
+    #map { height: 340px; margin: 0 24px 20px; border-radius: 8px; }
+    .banner { background: #da3633; color: #fff; padding: 10px 24px;
+              font-weight: 700; display: none; }
+    footer { text-align: center; padding: 14px;
+             font-size: .75rem; color: #8b949e; }
+  </style>
+</head>
+<body>
+<header>
+  <h1>🚗 VehicleNet Monitor</h1>
+  <span id="status-badge" class="badge normal">NORMAL</span>
+  <span style="margin-left:auto;font-size:.8rem;color:#8b949e"
+        id="ts"></span>
+</header>
+<div id="alert-banner" class="banner">⚠️ ALERT: <span id="alert-msg"></span></div>
+<div class="grid" id="cards"></div>
+<div id="map"></div>
+<footer>VehicleNet Node 2 Dashboard — auto-refresh every 3 s</footer>
+
+<script>
+let map, marker;
+function initMap(lat, lon) {
+  if (!map) {
+    map = L.map('map').setView([lat || 11.0, lon || 77.0], 13);
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',
+      {attribution:'© OpenStreetMap'}).addTo(map);
+    marker = L.marker([lat, lon]).addTo(map);
+  } else {
+    marker.setLatLng([lat, lon]);
+    map.panTo([lat, lon]);
+  }
+}
+
+function update() {
+  fetch('/api/latest').then(r=>r.json()).then(d=>{
+    if (!d.ts) return;
+    document.getElementById('ts').textContent = d.ts + ' UTC';
+    const isAlert = d.event && d.event !== 'NORMAL';
+    const badge = document.getElementById('status-badge');
+    badge.textContent = d.event || 'NORMAL';
+    badge.className = 'badge ' + (isAlert ? 'alert' : 'normal');
+    const banner = document.getElementById('alert-banner');
+    if (isAlert) {
+      banner.style.display = 'block';
+      document.getElementById('alert-msg').textContent =
+        d.event + ' | Accel: ' + (d.a_total||0).toFixed(3) + ' m/s²';
+    } else {
+      banner.style.display = 'none';
+    }
+    const metrics = [
+      ['Temperature', (d.tmp||0).toFixed(1)+' °C'],
+      ['Humidity',    (d.hum||0).toFixed(1)+' %'],
+      ['Pressure',    (d.prs||0).toFixed(1)+' hPa'],
+      ['Gas',         (d.gas||0).toFixed(1)+' ppm'],
+      ['Accel Total', (d.a_total||0).toFixed(3)+' m/s²'],
+      ['Speed',       (d.spd||0).toFixed(1)+' km/h'],
+      ['RSSI',        (d.rssi||0)+' dBm'],
+      ['Lat',         (d.lat||0).toFixed(6)],
+      ['Lon',         (d.lon||0).toFixed(6)],
+    ];
+    const cards = document.getElementById('cards');
+    cards.innerHTML = metrics.map(([l,v])=>
+      `<div class="card"><label>${l}</label><div class="val">${v}</div></div>`
+    ).join('');
+    if (d.lat && d.lon) initMap(d.lat, d.lon);
+  }).catch(()=>{});
+}
+
+update();
+setInterval(update, 3000);
+</script>
+</body>
+</html>
+"""
+
+app = Flask(__name__)
+
+@app.route("/")
+def dashboard():
+    return render_template_string(DASHBOARD_HTML)
+
+@app.route("/api/latest")
+def api_latest():
+    with state_lock:
+        return jsonify(latest_data)
+
+@app.route("/api/history")
+def api_history():
+    limit  = int(request.args.get("limit", 100))
+    event  = request.args.get("event", "")
+    conn   = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    if event:
+        c.execute("SELECT * FROM sensor_data WHERE event=? "
+                  "ORDER BY id DESC LIMIT ?", (event, limit))
+    else:
+        c.execute("SELECT * FROM sensor_data ORDER BY id DESC LIMIT ?",
+                  (limit,))
+    rows = [dict(r) for r in c.fetchall()]
+    conn.close()
+    return jsonify(rows)
+
+@app.route("/api/alerts")
+def api_alerts():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    c.execute("SELECT * FROM alerts ORDER BY id DESC LIMIT 50")
+    rows = [dict(r) for r in c.fetchall()]
+    conn.close()
+    return jsonify(rows)
+
+@app.route("/api/thresholds", methods=["GET", "POST"])
+def api_thresholds():
+    global THRESHOLDS
+    if request.method == "POST":
+        data = request.get_json(force=True)
+        with thresh_lock:
+            for k, v in data.items():
+                if k in THRESHOLDS:
+                    THRESHOLDS[k] = float(v)
+        return jsonify({"status": "ok", "thresholds": THRESHOLDS})
+    with thresh_lock:
+        return jsonify(THRESHOLDS)
+
+@app.route("/api/stats")
+def api_stats():
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT COUNT(*) FROM sensor_data")
+    total = c.fetchone()[0]
+    c.execute("SELECT COUNT(*) FROM alerts")
+    alert_count = c.fetchone()[0]
+    c.execute("SELECT MAX(ts) FROM sensor_data")
+    last_ts = c.fetchone()[0]
+    conn.close()
+    return jsonify({"total": total, "alerts": alert_count, "last_ts": last_ts})
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  MAIN
+# ══════════════════════════════════════════════════════════════════════════════
+if __name__ == "__main__":
+    init_db()
+
+    # Start LoRa worker thread
+    t = threading.Thread(target=lora_worker, daemon=True, name="LoRa")
+    t.start()
+
+    log.info("Dashboard → http://%s:%d", FLASK_HOST, FLASK_PORT)
+    app.run(host=FLASK_HOST, port=FLASK_PORT, debug=False, use_reloader=False)
