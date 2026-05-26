@@ -1,0 +1,321 @@
+/* 
+ * ╔══════════════════════════════════════════════════════════════╗
+ * ║  NODE 1 — ESP32 SENDER (Sensor Transmitter)                  ║
+ * ║  Sensors : MPU6050 | BME280 | MQ135 Gas | Neo-6M GPS         ║
+ * ║  Comm    : SX1278 LoRa 433MHz SF9 BW125 CR4/5 CRC ON         ║
+ * ║  Security: XOR rolling key + packet counter + CRC32          ║
+ * ╚══════════════════════════════════════════════════════════════╝
+ *
+ * DEBUG VERSION — sync word 0x12, blocking TX, verbose serial
+ * After confirming Pi receives packets, change LORA_SYNC_WORD back to 0xAB
+ */
+
+#include <SPI.h>
+#include <LoRa.h>
+#include <Wire.h>
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_Sensor.h>
+#include <Adafruit_BME280.h>
+#include <TinyGPS++.h>
+#include <math.h>
+
+// ── LoRa Pins ────────────────────────────────────────────────
+#define LORA_SS   5
+#define LORA_RST  14
+#define LORA_DIO0 2
+
+// ── LoRa RF Settings ─────────────────────────────────────────
+#define LORA_FREQ      433E6
+#define LORA_SF        9
+#define LORA_BW        125E3
+#define LORA_CR        5
+#define LORA_TX_POWER  17
+
+// ⚠ DEBUG: Using 0x12 (default) to test reception on Pi
+// Once Pi receives packets, change BOTH sides back to 0xAB
+#define LORA_SYNC_WORD 0x12
+
+// ── Node Identity ────────────────────────────────────────────
+#define NODE_ID        0x01
+#define EDGE_NODE_ID   0x02
+#define NETWORK_KEY    0x5A
+
+// ── Packet Counter ───────────────────────────────────────────
+uint32_t pktCounter = 0;
+
+// ── MQ135 ────────────────────────────────────────────────────
+#define MQ135_PIN     34
+#define MQ135_RL      10.0f
+#define MQ135_RO      76.63f
+#define MQ135_VREF    3.3f
+#define MQ135_ADC_MAX 4095.0f
+#define MQ135_A       116.6020f
+#define MQ135_B       -2.769f
+
+// ── Detection Thresholds ─────────────────────────────────────
+#define CRASH_ACCEL   25.0f
+#define FALL_ACCEL     1.5f
+#define GAS_LIMIT   2000.0f
+#define TX_INTERVAL  3000
+
+// ── GPS ──────────────────────────────────────────────────────
+#define GPS_BAUD 9600
+#define GPS_RX   16
+#define GPS_TX   17
+
+// ── LED ──────────────────────────────────────────────────────
+#define LED_PIN  27
+
+// ── Sensor Objects ───────────────────────────────────────────
+Adafruit_MPU6050 mpu;
+Adafruit_BME280  bme;
+TinyGPSPlus      gps;
+HardwareSerial   gpsSerial(1);
+
+bool mpuOk = false, bmeOk = false;
+
+// ════════════════════════════════════════════════════════════
+//  CRC32
+// ════════════════════════════════════════════════════════════
+uint32_t crc32(const char* data, size_t len) {
+  uint32_t crc = 0xFFFFFFFF;
+  for (size_t i = 0; i < len; i++) {
+    crc ^= (uint8_t)data[i];
+    for (int j = 0; j < 8; j++)
+      crc = (crc >> 1) ^ (0xEDB88320 & -(crc & 1));
+  }
+  return crc ^ 0xFFFFFFFF;
+}
+
+// ════════════════════════════════════════════════════════════
+//  XOR Encryption
+// ════════════════════════════════════════════════════════════
+String encryptPayload(const String& plaintext, uint32_t counter) {
+  String result = plaintext;
+  for (int i = 0; i < result.length(); i++) {
+    uint8_t key = (NETWORK_KEY ^ (counter & 0xFF)) + (i & 0x1F);
+    result[i] ^= key;
+  }
+  String hex = "";
+  for (int i = 0; i < result.length(); i++) {
+    if ((uint8_t)result[i] < 0x10) hex += "0";
+    hex += String((uint8_t)result[i], HEX);
+  }
+  return hex;
+}
+
+// ════════════════════════════════════════════════════════════
+//  MQ135 PPM Reading
+// ════════════════════════════════════════════════════════════
+float mq135_read_ppm() {
+  long sum = 0;
+  for (int i = 0; i < 8; i++) {
+    sum += analogRead(MQ135_PIN);
+    delayMicroseconds(200);
+  }
+  float adcVal = (float)(sum / 8);
+  if (adcVal <= 0.0f) return 0.0f;
+  float vout = adcVal * (MQ135_VREF / MQ135_ADC_MAX);
+  if (vout >= MQ135_VREF) return 0.0f;
+  float rs    = MQ135_RL * (MQ135_VREF - vout) / vout;
+  float ratio = rs / MQ135_RO;
+  if (ratio <= 0.0f) return 0.0f;
+  float ppm = MQ135_A * powf(ratio, MQ135_B);
+  return constrain(ppm, 0.0f, 10000.0f);
+}
+
+// ════════════════════════════════════════════════════════════
+//  LED
+// ════════════════════════════════════════════════════════════
+void blinkLED(int times, int ms = 100) {
+  for (int i = 0; i < times; i++) {
+    digitalWrite(LED_PIN, HIGH); delay(ms);
+    digitalWrite(LED_PIN, LOW);  delay(ms);
+  }
+}
+
+// ════════════════════════════════════════════════════════════
+//  SETUP
+// ════════════════════════════════════════════════════════════
+void setup() {
+  Serial.begin(115200);
+  pinMode(LED_PIN, OUTPUT);
+  delay(500);
+
+  Serial.println("\n╔══════════════════════════════╗");
+  Serial.println("║  NODE 1 — Sensor Sender      ║");
+  Serial.println("║  DEBUG MODE — SyncWord:0x12  ║");
+  Serial.println("╚══════════════════════════════╝");
+
+  Wire.begin(21, 22);
+  Wire.setClock(400000);
+  gpsSerial.begin(GPS_BAUD, SERIAL_8N1, GPS_RX, GPS_TX);
+
+  // ── LoRa ─────────────────────────────────────────────────
+  Serial.println("Initializing LoRa...");
+  LoRa.setPins(LORA_SS, LORA_RST, LORA_DIO0);
+  int retry = 0;
+  while (!LoRa.begin(LORA_FREQ)) {
+    Serial.print(".");
+    delay(500);
+    if (++retry >= 20) {
+      Serial.println("\n❌ LoRa FAILED — check wiring!");
+      while (1) delay(5000);
+    }
+  }
+  LoRa.setSpreadingFactor(LORA_SF);
+  LoRa.setSignalBandwidth(LORA_BW);
+  LoRa.setCodingRate4(LORA_CR);
+  LoRa.setTxPower(LORA_TX_POWER, PA_OUTPUT_PA_BOOST_PIN);  // PA_BOOST for Ra-02
+  LoRa.enableCrc();
+  LoRa.setSyncWord(LORA_SYNC_WORD);
+
+  Serial.println("✅ LoRa ready");
+  Serial.println("   Freq     : 433 MHz");
+  Serial.println("   SF       : 9");
+  Serial.println("   BW       : 125 kHz");
+  Serial.println("   SyncWord : 0x12 (DEBUG)");
+  Serial.println("   TxPower  : 17dBm PA_BOOST");
+
+  // ── MPU6050 ──────────────────────────────────────────────
+  if (mpu.begin(0x68)) {
+    mpu.setAccelerometerRange(MPU6050_RANGE_8_G);
+    mpu.setGyroRange(MPU6050_RANGE_500_DEG);
+    mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
+    mpuOk = true;
+    Serial.println("✅ MPU6050 OK");
+  } else {
+    Serial.println("⚠️  MPU6050 NOT found — sending zeros");
+  }
+
+  // ── BME280 ───────────────────────────────────────────────
+  if (bme.begin(0x76) || bme.begin(0x77)) {
+    bmeOk = true;
+    Serial.println("✅ BME280 OK");
+  } else {
+    Serial.println("⚠️  BME280 NOT found — sending zeros");
+  }
+
+  // ── MQ135 ────────────────────────────────────────────────
+  analogSetPinAttenuation(MQ135_PIN, ADC_11db);
+  Serial.println("✅ MQ135 ready");
+
+  blinkLED(3, 200);
+  Serial.println("\n📡 Transmitting every 3s...\n");
+  Serial.println("──────────────────────────────────────────");
+}
+
+// ════════════════════════════════════════════════════════════
+//  LOOP
+// ════════════════════════════════════════════════════════════
+void loop() {
+  unsigned long loopStart = millis();
+
+  // ── GPS ──────────────────────────────────────────────────
+  unsigned long gpsEnd = millis() + 200;
+  while (millis() < gpsEnd) {
+    if (gpsSerial.available()) gps.encode(gpsSerial.read());
+  }
+
+  float lat = 0, lon = 0, spd = 0;
+  if (gps.location.isValid() && gps.location.age() < 2000) {
+    lat = (float)gps.location.lat();
+    lon = (float)gps.location.lng();
+  }
+  if (gps.speed.isValid() && gps.speed.age() < 2000) {
+    spd = (float)gps.speed.kmph();
+  }
+
+  // ── MPU6050 ──────────────────────────────────────────────
+  float ax = 0, ay = 0, az = 0, gx = 0, gy = 0, gz = 0, totalAccel = 0;
+  if (mpuOk) {
+    sensors_event_t aEv, gyEv, tEv;
+    mpu.getEvent(&aEv, &gyEv, &tEv);
+    ax = aEv.acceleration.x;
+    ay = aEv.acceleration.y;
+    az = aEv.acceleration.z;
+    gx = gyEv.gyro.x;
+    gy = gyEv.gyro.y;
+    gz = gyEv.gyro.z;
+    totalAccel = sqrtf(ax*ax + ay*ay + az*az);
+  }
+
+  // ── BME280 ───────────────────────────────────────────────
+  float tmp = 0, hum = 0, prs = 0;
+  if (bmeOk) {
+    tmp = bme.readTemperature();
+    hum = bme.readHumidity();
+    prs = bme.readPressure() / 100.0F;
+  }
+
+  // ── MQ135 ────────────────────────────────────────────────
+  float gasPPM = mq135_read_ppm();
+
+  // ── Event Classification ──────────────────────────────────
+  String event = "NORMAL";
+  if (!mpuOk)                        event = "MPU_ERROR";
+  else if (totalAccel > CRASH_ACCEL) event = "CRASH";
+  else if (totalAccel < FALL_ACCEL)  event = "FALL";
+  else if (gasPPM > GAS_LIMIT)       event = "GAS_ALERT";
+
+  // ── Build Payload ─────────────────────────────────────────
+  // Format: N1|SRC|DST|EVENT|AX|AY|AZ|GX|GY|GZ|LAT|LON|TMP|HUM|PRS|GAS|SPD
+  String payload = "N1|";
+  payload += String(NODE_ID, HEX) + "|";
+  payload += String(EDGE_NODE_ID, HEX) + "|";
+  payload += event + "|";
+  payload += String(ax,  2) + "|";
+  payload += String(ay,  2) + "|";
+  payload += String(az,  2) + "|";
+  payload += String(gx,  3) + "|";
+  payload += String(gy,  3) + "|";
+  payload += String(gz,  3) + "|";
+  payload += String(lat, 6) + "|";
+  payload += String(lon, 6) + "|";
+  payload += String(tmp, 1) + "|";
+  payload += String(hum, 1) + "|";
+  payload += String(prs, 1) + "|";
+  payload += String(gasPPM, 1) + "|";
+  payload += String(spd, 1);
+
+  // ── Append CRC32 ─────────────────────────────────────────
+  uint32_t checksum = crc32(payload.c_str(), payload.length());
+  payload += "|" + String(checksum, HEX);
+
+  // ── Encrypt ──────────────────────────────────────────────
+  String encMsg = "ENC:" + String(pktCounter, HEX) + "::" + encryptPayload(payload, pktCounter);
+  pktCounter++;
+
+  // ── Transmit (blocking) ───────────────────────────────────
+  Serial.println(">> TX START #" + String(pktCounter - 1) +
+                 " len=" + String(encMsg.length()) + " bytes");
+  Serial.println(">> MSG prefix: " + encMsg.substring(0, 20) + "...");
+
+  LoRa.beginPacket();
+  LoRa.print(encMsg);
+  bool txOk = LoRa.endPacket(true);   // true = blocking — waits for TX done
+
+  if (txOk) {
+    blinkLED(1);
+    Serial.println("✅ TX DONE [#" + String(pktCounter - 1) + "] " + event +
+                   " | T:" + String(tmp, 1) + "°C" +
+                   " H:" + String(hum, 1) + "%" +
+                   " P:" + String(prs, 1) + "hPa" +
+                   " | Accel:" + String(totalAccel, 3) +
+                   " | Gas:" + String(gasPPM, 1) + "ppm" +
+                   " | GPS:" + String(lat, 5) + "," + String(lon, 5));
+  } else {
+    Serial.println("❌ TX FAILED #" + String(pktCounter - 1) +
+                   " — check LoRa wiring/power");
+    blinkLED(5, 50);
+  }
+
+  Serial.println("──────────────────────────────────────────");
+
+  // ── Wait, keep feeding GPS ────────────────────────────────
+  while (millis() - loopStart < TX_INTERVAL) {
+    if (gpsSerial.available()) gps.encode(gpsSerial.read());
+    delay(5);
+  }
+}
+
