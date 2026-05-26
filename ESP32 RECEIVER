@@ -1,0 +1,288 @@
+/*
+ * ╔══════════════════════════════════════════════════════════════╗
+ * ║  NODE 3 — V2V ALERT DASHBOARD (ESP32)                        ║
+ * ║  Comm    : SX1278 LoRa 433MHz SF9 BW125 CR4/5                ║
+ * ║  Security: XOR decryption + CRC32 verification               ║
+ * ║  Hardware: 16x2 I2C LCD, Green LED, Red LED, Buzzer          ║
+ * ╚══════════════════════════════════════════════════════════════╝
+ */
+
+#include <SPI.h>
+#include <LoRa.h>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+
+// ── Hardware Pins ────────────────────────────────────────────
+#define LORA_SS    5
+#define LORA_RST   14
+#define LORA_DIO0  2
+
+#define GREEN_LED  25
+#define RED_LED    26
+#define BUZZER     27
+
+// ── LoRa RF Settings ─────────────────────────────────────────
+#define LORA_FREQ      433E6
+#define LORA_SF        9
+#define LORA_BW        125E3
+#define LORA_CR        5
+#define LORA_SYNC_WORD 0x12   // Must match Node 1 and Node 2
+
+// ── Network Security ─────────────────────────────────────────
+#define NETWORK_KEY    0x5A
+#define MY_NODE_ID     "03"   // Node 3 (This dashboard)
+#define EDGE_NODE_ID   "02"   // Node 2 (Sender of the Alerts)
+
+// ── LCD Display (Address usually 0x27 or 0x3F) ───────────────
+LiquidCrystal_I2C lcd(0x27, 16, 2); 
+
+// ── State Variables ──────────────────────────────────────────
+bool alertActive = false;
+unsigned long alertStartTime = 0;
+String currentEvent = "";
+String currentLat = "";
+String currentLon = "";
+
+unsigned long lastPacketTime = 0;
+bool hasSignal = false;
+
+#define ALERT_DURATION_MS 15000  // Duration to flash the warning (15 seconds)
+#define SIGNAL_TIMEOUT_MS 15000  // Show "No Signal" if edge server goes offline for 15s
+
+// ════════════════════════════════════════════════════════════
+//  CRC32 Implementation (Matches Python zlib.crc32)
+// ════════════════════════════════════════════════════════════
+uint32_t calculateCRC32(const char* data, size_t len) {
+  uint32_t crc = 0xFFFFFFFF;
+  for (size_t i = 0; i < len; i++) {
+    crc ^= (uint8_t)data[i];
+    for (int j = 0; j < 8; j++) {
+      crc = (crc >> 1) ^ (0xEDB88320 & -(crc & 1));
+    }
+  }
+  return crc ^ 0xFFFFFFFF;
+}
+
+// ════════════════════════════════════════════════════════════
+//  Decrypt Payload
+// ════════════════════════════════════════════════════════════
+String decryptPayload(String hexStr, uint32_t counter) {
+  String result = "";
+  int len = hexStr.length();
+  byte raw[len / 2];
+  
+  for (int i = 0; i < len; i += 2) {
+    String byteString = hexStr.substring(i, i + 2);
+    raw[i / 2] = (byte) strtol(byteString.c_str(), NULL, 16);
+  }
+  
+  for (int i = 0; i < (len / 2); i++) {
+    uint8_t key = (NETWORK_KEY ^ (counter & 0xFF)) + (i & 0x1F);
+    result += (char)(raw[i] ^ key);
+  }
+  return result;
+}
+
+// ════════════════════════════════════════════════════════════
+//  Display Functions
+// ════════════════════════════════════════════════════════════
+void showNormalStatus() {
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("V2V Monitor [N3]");
+  lcd.setCursor(0, 1);
+  lcd.print("Link OK: Normal");
+}
+
+void showLostSignal() {
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("No Signal /");
+  lcd.setCursor(0, 1);
+  lcd.print("Waiting for Edge");
+}
+
+void setup() {
+  Serial.begin(115200);
+  
+  // Initialize Pins
+  pinMode(GREEN_LED, OUTPUT);
+  pinMode(RED_LED, OUTPUT);
+  pinMode(BUZZER, OUTPUT);
+  
+  digitalWrite(GREEN_LED, LOW); 
+  digitalWrite(RED_LED, LOW);
+  digitalWrite(BUZZER, LOW);
+
+  // Initialize LCD
+  Wire.begin(21, 22);
+  lcd.init();
+  lcd.backlight();
+  lcd.setCursor(0, 0);
+  lcd.print("V2V System Boot");
+  lcd.setCursor(0, 1);
+  lcd.print("Starting LoRa...");
+
+  Serial.println("\n╔═════════════════════════════════╗");
+  Serial.println("║  NODE 3 — V2V ALERT DASHBOARD   ║");
+  Serial.println("╚═════════════════════════════════╝");
+
+  LoRa.setPins(LORA_SS, LORA_RST, LORA_DIO0);
+  int retry = 0;
+  while (!LoRa.begin(LORA_FREQ)) {
+    Serial.print(".");
+    delay(500);
+    if (++retry > 20) {
+      lcd.clear();
+      lcd.print("LoRa Error!");
+      Serial.println("\n❌ LoRa init failed. Check wiring!");
+      while (true) delay(1000);
+    }
+  }
+  
+  LoRa.setSpreadingFactor(LORA_SF);
+  LoRa.setSignalBandwidth(LORA_BW);
+  LoRa.setCodingRate4(LORA_CR);
+  LoRa.enableCrc();
+  LoRa.setSyncWord(LORA_SYNC_WORD);
+
+  Serial.println("\n✅ LoRa Ready - Listening for Edge Server...\n");
+  
+  delay(1500);
+  showLostSignal();
+}
+
+void loop() {
+  // ── 1. Check for Incoming LoRa Packets (Non-Blocking) ──
+  int packetSize = LoRa.parsePacket();
+  if (packetSize) {
+    String rx = "";
+    while (LoRa.available()) {
+      rx += (char)LoRa.read();
+    }
+    
+    int rssi = LoRa.packetRssi();
+    
+    if (rx.startsWith("ENC:")) {
+      int firstColon = rx.indexOf(':', 4);
+      int doubleColon = rx.indexOf("::", 4);
+      
+      if (firstColon > 0 && doubleColon > 0) {
+        String counterHex = rx.substring(4, doubleColon);
+        String payloadHex = rx.substring(doubleColon + 2);
+        
+        uint32_t counter = strtoul(counterHex.c_str(), NULL, 16);
+        String decrypted = decryptPayload(payloadHex, counter);
+        
+        int lastPipe = decrypted.lastIndexOf('|');
+        if (lastPipe > 0) {
+          String body = decrypted.substring(0, lastPipe);
+          String crcHex = decrypted.substring(lastPipe + 1);
+          
+          uint32_t rxCrc = strtoul(crcHex.c_str(), NULL, 16);
+          uint32_t calcCrc = calculateCRC32(body.c_str(), body.length());
+          
+          if (rxCrc == calcCrc) {
+            
+            // ── SAFE TOKEN PARSING (Array size 20 prevents crash) ──
+            String tokens[20]; 
+            int tokenCount = 0;
+            int startIndex = 0;
+            
+            for (int i = 0; i < body.length(); i++) {
+              if (body[i] == '|') {
+                if (tokenCount < 20) {
+                  tokens[tokenCount++] = body.substring(startIndex, i);
+                }
+                startIndex = i + 1;
+              }
+            }
+            if (tokenCount < 20) {
+              tokens[tokenCount++] = body.substring(startIndex);
+            }
+            
+            // Debug: Who sent this packet?
+            if (tokenCount > 0) {
+                if (tokens[0] == "N1") {
+                    Serial.println("ℹ️ [IGNORED] Packet from Node 1 (Sensor Car). Waiting for Node 2...");
+                }
+                else if (tokens[0] == "N2" && tokenCount >= 6 && tokens[2] == MY_NODE_ID) {
+                  
+                  // WE HAVE A VALID PACKET FROM THE EDGE SERVER!
+                  lastPacketTime = millis();
+                  hasSignal = true;
+                  String event = tokens[3];
+                  
+                  if (event == "NORMAL") {
+                    if (!alertActive) {
+                      showNormalStatus();
+                      digitalWrite(GREEN_LED, HIGH);
+                    }
+                    Serial.println("✅ [STATUS NORMAL] Heartbeat received from Edge Server.");
+                  }
+                  else {
+                    // IT IS AN ALERT!
+                    Serial.println("────────────────────────────────────────");
+                    Serial.println("🚨[EMERGENCY V2V ALERT RECEIVED]");
+                    Serial.println("   ► Event : " + event);
+                    Serial.println("   ► RSSI  : " + String(rssi) + " dBm");
+                    Serial.println("   ► GPS   : " + tokens[4] + ", " + tokens[5]);
+                    Serial.println("────────────────────────────────────────\n");
+                    
+                    alertActive = true;
+                    alertStartTime = millis();
+                    currentEvent = event;
+                    currentLat = tokens[4];
+                    currentLon = tokens[5];
+                    
+                    lcd.clear();
+                    lcd.setCursor(0, 0);
+                    lcd.print("!! " + event + " !!");
+                    lcd.setCursor(0, 1);
+                    String locStr = currentLat.substring(0, 6) + "," + currentLon.substring(0, 6);
+                    lcd.print("Loc:" + locStr);
+                    
+                    digitalWrite(GREEN_LED, LOW);
+                  }
+                }
+            }
+          } else {
+            Serial.println("❌ [SECURITY] CRC Mismatch on incoming packet.");
+          }
+        }
+      }
+    }
+  }
+
+  // ── 2. Handle Hardware States (Non-Blocking) ──
+  if (alertActive) {
+    if (millis() - alertStartTime > ALERT_DURATION_MS) {
+      alertActive = false;
+      digitalWrite(RED_LED, LOW);
+      digitalWrite(BUZZER, LOW);
+      
+      if (hasSignal) {
+          digitalWrite(GREEN_LED, HIGH); 
+          showNormalStatus();
+      }
+      Serial.println("✅ [ALERT CLEARED] Returning to normal monitoring.\n");
+    } 
+    else {
+      // Fast blink 400ms phase (200ms ON, 200ms OFF)
+      unsigned long blinkPhase = (millis() - alertStartTime) % 400;
+      if (blinkPhase < 200) {
+        digitalWrite(RED_LED, HIGH);
+        digitalWrite(BUZZER, HIGH);
+      } else {
+        digitalWrite(RED_LED, LOW);
+        digitalWrite(BUZZER, LOW);
+      }
+    }
+  } 
+  else if (hasSignal && (millis() - lastPacketTime > SIGNAL_TIMEOUT_MS)) {
+    hasSignal = false;
+    digitalWrite(GREEN_LED, LOW);
+    showLostSignal();
+    Serial.println("⚠️ [SIGNAL LOST] No packets from edge server for 15s.");
+  }
+}
