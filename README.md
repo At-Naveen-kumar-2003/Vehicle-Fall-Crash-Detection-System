@@ -67,7 +67,6 @@ The system also supports Vehicle-to-Vehicle (V2V) alert communication to notify 
 
 ---
 
----
 
 # 📂 Project File Description
 
